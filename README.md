@@ -10,6 +10,6 @@ And already [before that](https://cosmos.esa.int/web/gaia/iow_20200812), it was 
 ## Implementing the formalism developed in [Weiler et al. (2023)](https://ui.adsabs.harvard.edu/abs/2023A%26A...671A..52W/abstract)
 
 Michael Weiler has developed a formalism that allows to infer the properties of spectral lines directly from the XP coefficients (the format the XP spectra are actually stored in).
-This repository aims at implementing his formalism in python. 
+This repository aims at implementing his formalism in python (by translating from his original R code). 
 
 CURRENTLY UNDER DEVELOPMENT... please stand by.
