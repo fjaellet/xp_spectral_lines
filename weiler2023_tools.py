@@ -100,15 +100,16 @@ def rotate_matrix(M, Rot):
 class XPConstants(object):
     """
     Summarises all the relatively constant objects used in the calculations.
-    From transformatices to the LSF
+    From Hermite transformation matrices to the LSF.
+
+    Usage examples:
+    >>> XPConstants = weiler2023_tools.XPConstants()
+    >>> XPConstants.TrafoRP
+    >>> XPConstants.get_pseudowavelength(770., instrument="rp", shift=0.)
     """
     def __init__(self, dr="dr3", calib="dr3+weiler2023"):
         """
         Reading everything in ./ConfigurationData/
-        
-        Usage:
-        >>> XPConstants = weiler2023_tools.XPConstants()
-        >>> XPConstants.TrafoRP # for example
         """
         ### First the things that do not change:
         
@@ -149,6 +150,57 @@ class XPConstants(object):
             self.LSFRP        = np.genfromtxt("./ConfigurationData/LSFModel_RP.csv", delimiter=',')
         else:
             raise ValueError("Unknown 'calib' option")
+        
+    def get_resolution(self, l, instrument="bp", shift=0.):
+        """
+        Calculate resolution for a given wavelength 
+        by interpolating the dispersion relation.
+        
+        # Arguments:
+            l  - Wavelength in nm
+        """
+        if instrument=="bp":
+            return np.interp(l, self.DispersionBP[:,0], self.DispersionBP[:,1]) + shift
+        elif instrument=="rp":
+            return np.interp(l, self.DispersionRP[:,0], self.DispersionRP[:,1]) + shift
+
+    def get_LSF_width(self, u0, instrument="bp", order=0, n=55):
+        """
+        Get the width of the line spread function.
+        """
+        D = 0.1
+        if instrument == "bp":
+            a   = self.aBP
+            b   = self.bBP
+            LSF = self.LSFBP
+        elif instrument == "rp":
+            a   = self.aRP
+            b   = self.bRP
+            LSF = self.LSFRP
+        if n > 0:
+            H   = HermiteFunction(np.array([(u0-b)/a]), 100).ravel()
+            lsf = np.dot(H, LSF.T)
+        else:
+            lsf = LSF
+        print(lsf.shape)
+        print(self.D1[0:(n+1), 0:(n+1)].shape)
+        if order == 0:
+            c1 = np.dot(self.D1[0:(n+1), 0:(n+1)], np.concatenate((lsf, np.zeros(1))))
+            l  = getLinesInNDeriv(c1, np.diag(np.ones(len(c1))), instrument=instrument)
+        else:
+            c3 = np.dot(self.D3[0:(n+3), 0:(n+3)], np.concatenate((lsf, np.zeros(3))))
+            l  = getLinesInNDeriv(c3, np.diag(np.ones(len(c3))), instrument=instrument)
+        print(l)
+        idx1 = np.argmin(np.abs(l['estimLinePos']-u0))
+        idx2 = np.argmin(np.abs(l['estimLinePos']-u0+D))
+        idx3 = np.argmin(np.abs(l['estimLinePos']-u0-D))
+
+        idx = np.unique(np.concatenate(([idx1], [idx2], [idx3])))
+        print(idx1, idx2, idx3, idx)
+        return {'p1': l['estimLinePos'][idx[0]], 
+                'p2': l['estimLinePos'][idx[1]], 
+                'D': np.abs(l['estimLinePos'][idx[0]] - l['estimLinePos'][idx[1]])}
+
 
 class XP_Spectrum(object):
     """
@@ -226,6 +278,72 @@ class XP_Spectrum(object):
             raise ValueError("Choose either 'bp' or 'rp' as instrument.")
         l = xx * a + b
         return l, internal
+    
+
+def getRsNew(u0, L, c, cov, 
+             setup=None, instrument="bp", K=2, filter=None):
+    """
+    Computes the product of response times SPD in Taylor approximation
+    including the computation of the errors. See Vol. IX, p. 92
+    
+    # Inputs:
+        u0 - sample position
+        L  - development of the LSF in Hermite functions
+        c - the vector of coefficients of the source in Hermite functions (continuum approximation)
+        cov - the covariance matrix of c
+        instrument - the instrument ("bp" or "rp", needed for the Hermite basis configuration only)
+        setup - the configuration of Hermite basis functions
+        K - the order of the approximation in the deconvolution (default: 2)
+    # Output:
+        vector with the 0th to Kth derivative at u0
+
+    """
+    if setup == None:
+        setup = XPConstants()
+    if instrument == "bp":
+        a, b     = self.setup.aBP, self.setup.bBP
+    elif instrument == "rp":
+        a, b     = self.setup.aRP, self.setup.bRP
+
+    H   = np.zeros((K+1, n+4))
+    tmp = HermiteFunction((u0-b) / a, n+4)
+
+    if K == 0:
+        S = np.dot(tmp[:, :n], c)
+        covS = np.dot(tmp[:, :n], np.dot(cov, tmp[:, :n]))
+    else:
+        H[0, :] = tmp
+        if K > 0:
+            H[1, :] = np.dot(tmp, setup.D1[0:(n+4), 0:(n+4)]) / a
+            if K > 1:
+                H[2, :] = np.dot(tmp, setup.D2[0:(n+4), 0:(n+4)]) / (a*a)
+                if K > 2:
+                    H[3, :] = np.dot(tmp, setup.D3[0:(n+4), 0:(n+4)]) / (a*a*a)
+                    if K > 3:
+                        H[4, :] = np.dot(tmp, setup.D4[0:(n+4), 0:(n+4)]) / (a*a*a*a)
+
+        f = np.dot(H, np.concatenate((c, np.zeros(4))))
+
+        Cov = np.zeros((n+4, n+4))
+        Cov[:n, :n] = cov
+        covf = np.dot(H, np.dot(Cov, H.T))
+
+        LM = makeLMatrix(L, u0, setup, K=K) * a
+
+        if filter is None:
+            LM = np.linalg.solve(LM)  # CHECK HERE!
+        else:
+            sv = np.linalg.svd(LM)
+            d = sv[1] / max(sv[1])
+            SI = 1 / sv[1]
+            SI[np.where(d < filter)] = 0
+            LM = np.dot(np.dot(sv[0], np.diag(SI)), sv[2])
+
+        S = np.asarray(np.dot(LM, f)).flatten()
+        covS = np.dot(LM, np.dot(covf, LM.T))
+
+    return {"u": u0, "S": S, "sigS": np.sqrt(np.diag(covS)), "f": f, "LH": np.dot(LM, H)}
+
 
 def getRoots(coef, cov, setup=None, n=None, small=1E-7, conditioning=False):
     """
@@ -450,7 +568,6 @@ def getLinesInNDeriv(coefIn, covIn, N=0, instrument="none",
     signifInf = 1 - np.exp(-xinf*xinf / 2)
 
     widths = [np.min(pinf[pi < pinf]) - np.max(pinf[pi > pinf]) for pi in p]
-    # TBD!
     widthsError = [np.sqrt(inf["covariance"][np.where(pinf == min(pinf[pi > pinf]))[0][0], 
                                              np.where(pinf == min(pinf[pi > pinf]))[0][0]] + 
                            inf["covariance"][np.where(pinf == max(pinf[pi < pinf]))[0][0], 
@@ -478,39 +595,68 @@ def getLinesInNDeriv(coefIn, covIn, N=0, instrument="none",
            'instrument': instrument}
     return res
 
-def getLSFWidth(LSF, u0, instrument, config, HermiteTransformationMatrices, order=0):
+
+def analyseLine(f, P, wavelength, setup, HI, V, LSF, K=2, dispShift=0):
     """
-    Get the width of the line spread function.
+    Derives the equivalent widths for a narrow line
+
+    # Inputs:
+        res      - dictionary containing the extrema of the spectrum
+        lambda   - the wavelength of the line to look for, in nm
+        LSF      - if not provided, an LSF from the disc is read
+        LSFwidth - the min and max value between which the line has to be
+
     """
-    D = 0.1
-    if instrument == "BP":
-        a = setup.aBP
-        b = setup.bBP
-        n = setup.LSFBP
-    elif instrument == "RP":
-        a = setup.aRP
-        b = setup.bRP
-        n = setup.LSFRP
-
-    if LSF['n'] > 0:
-        H = HermiteFunction((u0-b)/a, LSF['n']+LSF['dn'])
-        lsf = np.dot(H, LSF['L'].T)
+    # Select the instrument to use:
+    if wavelength < 650:
+        instrument = "BP"
     else:
-        lsf = LSF['L']
+        instrument = "RP"
 
-    if order == 0:
-        c1 = np.dot(HermiteTransformationMatrices['D1'][0:(n+1), 0:(n+1)], np.concatenate((lsf, np.zeros(1))))
-        l = getLines(c1, np.diag(np.ones(len(c1))), instrument=instrument)
+    im = readDR3InstrumentModel(XP)
+    uL = im.disp(wavelength) + dispShift  # nominal position of the line in pseudo-wavelength
+
+    if P[0]["N"] == 2:
+        higherOrder = True
     else:
-        c3 = np.dot(HermiteTransformationMatrices['D3'][0:(n+3), 0:(n+3)], np.concatenate((lsf, np.zeros(3))))
-        l = getLines(c3, np.diag(np.ones(len(c3))), instrument=instrument)
+        higherOrder = False
 
-    idx1 = np.argmin(np.abs(l['estimLinePos']-u0))
-    idx2 = np.argmin(np.abs(l['estimLinePos']-u0+D))
-    idx3 = np.argmin(np.abs(l['estimLinePos']-u0-D))
+    if higherOrder:
+        w = getLSFWidth(LSF, uL, XP, setup, HermiteTransformationMatrices, order=2)
+    else:
+        w = getLSFWidth(LSF, uL, XP, setup, HermiteTransformationMatrices, order=0)
 
-    idx = np.unique(np.concatenate(([idx1], [idx2], [idx3])))
+    LSFwidth = sorted([w["p1"], w["p2"]])
 
-    return {'p1': l['estimLinePos'][idx[0]], 
-            'p2': l['estimLinePos'][idx[1]], 
-            'D': np.abs(l['estimLinePos'][idx[0]] - l['estimLinePos'][idx[1]])}
+    n = len(P)  # the number of spectra in the input file
+
+    result = []
+
+    for i in range(n):
+        spectrum = extractSpectrumFromSingeFile(f, i, V=V)
+        if XP == "BP":
+            coef = spectrum["bp"]["coef"]
+            idx = np.where((P[i]["bp"]["estimLinePos"] > LSFwidth[0]) & (P[i]["bp"]["estimLinePos"] < LSFwidth[1]))[0]
+        else:
+            coef = spectrum["rp"]["coef"]
+            idx = np.where((P[i]["rp"]["estimLinePos"] > LSFwidth[0]) & (P[i]["rp"]["estimLinePos"] < LSFwidth[1]))[0]
+
+        hit = len(idx)
+
+        if hit == 1:
+            if higherOrder:
+                W = getNarrowLineEquivalentWidthSecondOrder(spectrum, P[i], idx, XP, setup, 
+                                                            LSF, im.dispInv, HermiteTransformationMatrices, 
+                                                            HI, K=K, uLine=uL)
+            else:
+                W = getNarrowLineEquivalentWidth(spectrum, P[i], idx, XP, setup, LSF, im.dispInv, 
+                                                 HermiteTransformationMatrices, HI, K=K, uLine=uL)
+            coefCont = np.asarray(W["coefCont"], dtype=float)
+        else:  # get upper limit:
+            tmp = getNarrowLineUpperLimit(spectrum, uL, XP, setup, LSF, im.dispInv, HermiteTransformationMatrices, HI, K=K, Q=7.709)
+            W = {"W": 0, "errW": tmp["upperLimit"]}
+            coefCont = np.nan
+
+        result.append({"source_id": f["source_id"][i], "W": W["W"], "errW": W["errW"], "coef": coef, "coefCont": coefCont, "index": idx, "ExtremaInRange": hit, "dispShift": dispShift, "LSFwidth": w["D"]})
+
+    return result
